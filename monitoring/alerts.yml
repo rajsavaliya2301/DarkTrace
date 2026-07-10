@@ -1,0 +1,136 @@
+# =============================================================================
+# DarkTrace - Prometheus Alerting Rules
+# =============================================================================
+
+groups:
+  # ── Service Health ──────────────────────────────────────────────────────────
+  - name: service_health
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "{{ $labels.instance }} of job {{ $labels.job }} has been down for more than 1 minute."
+
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High 5xx error rate on {{ $labels.job }}"
+          description: "More than 5% of requests are returning 5xx errors for {{ $labels.job }}."
+
+  # ── Backend Performance ────────────────────────────────────────────────────
+  - name: backend_performance
+    rules:
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API latency (p95 > 2s)"
+          description: "The 95th percentile API response time has exceeded 2 seconds for 5 minutes."
+
+      - alert: HighCPUUsage
+        expr: rate(process_cpu_seconds_total{job="backend"}[5m]) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend CPU usage is high"
+          description: "Backend CPU usage has exceeded 80% for 10 minutes."
+
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes{job="backend"} / (1024 * 1024 * 1024) > 3.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend memory usage is high"
+          description: "Backend is using more than 3.5GB of RAM."
+
+  # ── Data Stores ────────────────────────────────────────────────────────────
+  - name: datastores
+    rules:
+      - alert: MongoDBDown
+        expr: up{job="mongodb"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoDB is down"
+          description: "MongoDB has been unreachable for more than 1 minute."
+
+      - alert: ElasticsearchDown
+        expr: up{job="elasticsearch"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Elasticsearch is down"
+          description: "Elasticsearch has been unreachable for more than 1 minute."
+
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down"
+          description: "Redis has been unreachable for more than 1 minute."
+
+      - alert: Neo4jDown
+        expr: up{job="neo4j"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Neo4j is down"
+          description: "Neo4j graph database has been unreachable for more than 1 minute."
+
+      - alert: ElasticsearchHighMemory
+        expr: elasticsearch_jvm_memory_used_bytes{area="heap"} / elasticsearch_jvm_memory_max_bytes{area="heap"} > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elasticsearch heap usage is high"
+          description: "Elasticsearch heap usage has exceeded 85% for 10 minutes."
+
+  # ── Crawler & NLP Workers ──────────────────────────────────────────────────
+  - name: workers
+    rules:
+      - alert: CrawlerWorkerDown
+        expr: up{job="crawler-worker"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Crawler worker is down"
+          description: "The crawler worker has been unreachable for more than 2 minutes."
+
+      - alert: NLPWorkerDown
+        expr: up{job="nlp-worker"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NLP worker is down"
+          description: "The NLP worker has been unreachable for more than 2 minutes."
+
+  # ── Security ───────────────────────────────────────────────────────────────
+  - name: security
+    rules:
+      - alert: HighLoginFailureRate
+        expr: rate(http_requests_total{path="/v1/auth/login", status="401"}[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High login failure rate detected"
+          description: "More than 0.5 failed login attempts per second for 5 minutes. Possible brute-force attack."

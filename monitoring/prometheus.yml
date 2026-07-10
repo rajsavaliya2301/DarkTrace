@@ -1,0 +1,139 @@
+# =============================================================================
+# DarkTrace - Prometheus Configuration
+# =============================================================================
+# Scrapes metrics from all DarkTrace services.
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: darktrace
+    environment: ${ENVIRONMENT:-production}
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+# Rule files
+rule_files:
+  - "alerts.yml"
+
+# Scrape configurations
+scrape_configs:
+
+  # ── Prometheus self-monitoring ────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - "localhost:9090"
+        labels:
+          service: prometheus
+
+  # ── Backend API ───────────────────────────────────────────────────────────
+  - job_name: backend
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - "backend:8000"
+        labels:
+          service: backend
+          tier: application
+
+  # ── MongoDB Exporter ──────────────────────────────────────────────────────
+  - job_name: mongodb
+    static_configs:
+      - targets:
+          - "mongodb-exporter:9216"
+        labels:
+          service: mongodb
+          tier: data
+
+  # ── Elasticsearch Exporter ────────────────────────────────────────────────
+  - job_name: elasticsearch
+    static_configs:
+      - targets:
+          - "elasticsearch-exporter:9114"
+        labels:
+          service: elasticsearch
+          tier: data
+
+  # ── Neo4j Exporter ────────────────────────────────────────────────────────
+  - job_name: neo4j
+    static_configs:
+      - targets:
+          - "neo4j:2004"
+        labels:
+          service: neo4j
+          tier: data
+
+  # ── Redis Exporter ────────────────────────────────────────────────────────
+  - job_name: redis
+    static_configs:
+      - targets:
+          - "redis-exporter:9121"
+        labels:
+          service: redis
+          tier: data
+
+  # ── RabbitMQ Exporter ─────────────────────────────────────────────────────
+  - job_name: rabbitmq
+    static_configs:
+      - targets:
+          - "rabbitmq:15692"
+        labels:
+          service: rabbitmq
+          tier: message-broker
+
+  # ── Crawler Worker ────────────────────────────────────────────────────────
+  - job_name: crawler-worker
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - "crawler-worker:8000"
+        labels:
+          service: crawler-worker
+          tier: worker
+
+  # ── NLP Worker ────────────────────────────────────────────────────────────
+  - job_name: nlp-worker
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - "nlp-worker:8000"
+        labels:
+          service: nlp-worker
+          tier: worker
+
+  # ── Node Exporter (host metrics) ──────────────────────────────────────────
+  - job_name: node
+    static_configs:
+      - targets:
+          - "node-exporter:9100"
+        labels:
+          service: node
+          tier: infrastructure
+
+  # ── Docker daemon metrics ────────────────────────────────────────────────
+  - job_name: docker
+    static_configs:
+      - targets:
+          - "docker-exporter:9323"
+        labels:
+          service: docker
+          tier: infrastructure
+
+  # ── Caddy / Nginx ─────────────────────────────────────────────────────────
+  - job_name: nginx
+    static_configs:
+      - targets:
+          - "frontend:8080"
+        labels:
+          service: nginx
+          tier: proxy

@@ -1,0 +1,259 @@
+# =============================================================================
+# DarkTrace - Deploy Pipeline
+# =============================================================================
+# Triggers on push to main after CI passes.
+# Deploys to staging automatically, then requires manual approval for prod.
+# =============================================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOCKER_REGISTRY: ghcr.io
+  DOCKER_NAMESPACE: ${{ github.repository_owner }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+
+  # ── Build and Push Docker Images ──────────────────────────────────────────
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Note: image_tag is available via ${{ github.sha }} in downstream jobs
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - backend
+          - frontend
+          - crawler-worker
+          - nlp-worker
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_NAMESPACE }}/${{ matrix.service }}
+          tags: |
+            type=sha,prefix=,suffix=,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.service }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_NAMESPACE }}/${{ matrix.service }}
+          subject-digest: ${{ steps.meta.outputs.digest }}
+          push-to-registry: true
+
+  # ── Deploy to Staging ─────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+      url: https://staging.darktrace.internal
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.STAGING_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.STAGING_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy via Docker Compose
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.STAGING_USER }}@${{ secrets.STAGING_HOST }} << 'EOF'
+            cd /opt/darktrace
+            # Save new .env file from secrets
+            cat > .env << 'ENVEOF'
+            ${{ secrets.STAGING_ENV_FILE }}
+            ENVEOF
+            # Pull latest images
+            docker compose pull
+            # Restart services with zero-downtime
+            docker compose up -d --remove-orphans --no-deps
+            # Clean up old images
+            docker image prune -f
+          EOF
+
+      - name: Wait for deployment to stabilize
+        run: sleep 30
+
+      - name: Verify deployment health
+        run: |
+          curl -sf --retry 10 --retry-delay 5 --retry-connrefused https://staging.darktrace.internal/health || exit 1
+
+  # ── Smoke Tests ───────────────────────────────────────────────────────────
+  smoke-tests:
+    name: Smoke Tests
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check API health
+        run: |
+          curl -sf https://staging.darktrace.internal/health | jq -e '.status == "healthy"' || exit 1
+
+      - name: Check frontend is serving
+        run: |
+          curl -sf https://staging.darktrace.internal/ | grep -q "DarkTrace" || exit 1
+
+      - name: Test authentication endpoint
+        run: |
+          response=$(curl -sf -X POST https://staging.darktrace.internal/v1/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"${{ secrets.TEST_USER_EMAIL }}","password":"${{ secrets.TEST_USER_PASSWORD }}"}' \
+            -w "\n%{http_code}")
+          http_code=$(echo "$response" | tail -1)
+          if [ "$http_code" != "200" ]; then
+            echo "Auth endpoint returned $http_code"
+            exit 1
+          fi
+
+      - name: Test MongoDB connectivity via API
+        run: |
+          curl -sf https://staging.darktrace.internal/admin/health | jq -e '.services.mongodb.status == "up"' || exit 1
+
+      - name: Test Elasticsearch connectivity via API
+        run: |
+          curl -sf https://staging.darktrace.internal/admin/health | jq -e '.services.elasticsearch.status == "up"' || exit 1
+
+  # ── Deploy to Production (Manual Approval) ────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    needs: smoke-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://darktrace.internal
+    concurrency: production-deploy
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PRODUCTION_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.PRODUCTION_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to Production (rolling update)
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.PRODUCTION_USER }}@${{ secrets.PRODUCTION_HOST }} << 'EOF'
+            cd /opt/darktrace
+
+            # Backup current state
+            docker compose exec -T mongodb mongodump --authenticationDatabase admin \
+              -u ${{ secrets.MONGO_USER }} -p ${{ secrets.MONGO_PASSWORD }} \
+              --archive=/tmp/pre-deploy-backup.archive 2>/dev/null || true
+
+            # Update environment
+            cat > .env << 'ENVEOF'
+            ${{ secrets.PRODUCTION_ENV_FILE }}
+            ENVEOF
+
+            # Pull new images
+            docker compose pull
+
+            # Perform rolling update (one service at a time)
+            for service in backend frontend crawler-worker nlp-worker; do
+              echo "Updating $service..."
+              docker compose up -d --no-deps --scale ${service}=0 ${service} 2>/dev/null || true
+              docker compose up -d --no-deps --scale ${service}=1 ${service}
+              sleep 15
+            done
+
+            # Clean up
+            docker image prune -f --filter "until=24h"
+          EOF
+
+      - name: Wait for deployment to stabilize
+        run: sleep 45
+
+      - name: Verify production health
+        run: |
+          curl -sf --retry 15 --retry-delay 10 --retry-connrefused https://darktrace.internal/health || exit 1
+
+      - name: Run production smoke tests
+        run: |
+          echo "=== Production Smoke Tests ==="
+          curl -sf https://darktrace.internal/health | jq -e '.status == "healthy"' || exit 1
+          curl -sf https://darktrace.internal/ | grep -q "DarkTrace" || exit 1
+          echo "All production smoke tests passed!"
+
+      - name: Notify deployment success
+        if: success()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "✅ DarkTrace deployment to production successful!\nCommit: ${{ github.sha }}\nDeployed by: ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
+
+      - name: Notify deployment failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "❌ DarkTrace deployment to production *FAILED*!\nCommit: ${{ github.sha }}\nDeployed by: ${{ github.actor }}\nCheck: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
